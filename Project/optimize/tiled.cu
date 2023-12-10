@@ -3,73 +3,57 @@
 #include "gpu-new-forward.h"
 #define TILE_WIDTH 16
 
-__global__ void conv_forward_kernel(float *output, const float *input, const float *mask, const int B, const int M, const int C, const int H, const int W, const int K,const int S)
+//__constant__ float Mask[6000];
+__global__ void conv_forward_kernel(float *output, const float *input, const float *mask, const int B, const int M, const int C, const int H, const int W, const int K, const int S)
 {
-    /*
-    Modify this function to implement the forward pass described in Chapter 16.
-    We have added an additional dimension to the tensors to support an entire mini-batch
-    The goal here is to be correct AND fast.
+    extern __shared__ float input_tile[];
 
-    Function paramter definitions:
-    output - output
-    input - input
-    mask - convolution kernel
-    B - batch_size (number of images in x)
-    M - number of output feature maps
-    C - number of input feature maps
-    H - input height dimension
-    W - input width dimension
-    K - kernel height and width (K x K)
-    S - stride step length
-    */
+    const int H_out = (H - K) / S + 1;
+    const int W_out = (W - K) / S + 1;
 
-    const int H_out = (H - K)/S + 1;
-    const int W_out = (W - K)/S + 1;
-
-    // (void)H_out; // silence declared but never referenced warning. remove this line when you start working
-    // (void)W_out; // silence declared but never referenced warning. remove this line when you start working
-
-    // We have some nice #defs for you below to simplify indexing. Feel free to use them, or create your own.
-    // An example use of these macros:
-    // float a = in_4d(0,0,0,0)
-    // out_4d(0,0,0,0) = a
+    int blockWidth = (TILE_WIDTH - 1) * S + K;
 
     #define out_4d(i3, i2, i1, i0) output[(i3) * (M * H_out * W_out) + (i2) * (H_out * W_out) + (i1) * (W_out) + i0]
     #define in_4d(i3, i2, i1, i0) input[(i3) * (C * H * W) + (i2) * (H * W) + (i1) * (W) + i0]
     #define mask_4d(i3, i2, i1, i0) mask[(i3) * (C * K * K) + (i2) * (K * K) + (i1) * (K) + i0]
+    #define tile_3d(i2, i1, i0) input_tile[(i2) * (blockWidth * blockWidth) + (i1) * (blockWidth) + i0]
 
-    // Insert your GPU convolution kernel code here
-    int W_tile = ceil(1.0 * W_out / TILE_WIDTH);
-    int H_tile = ceil(1.0 * H_out / TILE_WIDTH);
-    int blockWidth = TILE_WIDTH + K - 1;
+    int ty = threadIdx.y;
+    int tx = threadIdx.x;
 
     int bx = blockIdx.x;
     int by = blockIdx.y;
     int bz = blockIdx.z;
-    int h = (blockIdx.y / W_tile) * TILE_WIDTH + threadIdx.y;
-    int w = (blockIdx.y % W_tile) * TILE_WIDTH + threadIdx.x;
-    int tIdx = threadIdx.x + threadIdx.y * blockWidth;
-    float acc = 0.0f;
+    int Width_grid = ceil(1.0 * W_out / TILE_WIDTH);
+    int h = (by / Width_grid) * TILE_WIDTH + ty;
+    int w = (by % Width_grid) * TILE_WIDTH + tx;
 
-    for (int c = 0; c < C; c++) {
-        for (int p = 0; p < K; p++) {
-            for (int q = 0; q < K; q++) {
-                if (h * S + p < H && w * S + q < W) {
-                    acc += in_4d(bz, c, h*S+p, w*S+q) * mask_4d(bx, c, p, q);
-                }
-            }
-        }
-        __syncthreads();
-    }
+    int h_start = h  - ty;
+    int w_start = w  - tx;
+
+    // pre-load the input array into shared memory
+    for (int c = 0; c < C; c++)
+        for (int p = ty; p < blockWidth; p += TILE_WIDTH)
+            for (int q = tx; q < blockWidth; q += TILE_WIDTH)
+                tile_3d(c, p, q) = in_4d(bz, c, h_start * S + p, w_start * S + q);
+
+    __syncthreads();
     if (h < H_out && w < W_out) {
-        out_4d(bz, bx, h, w) = acc;
+        float res = 0.0;
+        for (int c = 0; c < C; c++)
+            for (int p = 0; p < K; p++)
+                for (int q = 0; q < K; q++)
+                    if(ty * S + p < blockWidth && tx * S + q < blockWidth)
+                        res += tile_3d(c, ty * S + p, tx * S + q) * mask_4d(bx, c, p, q);
+        out_4d(bz, bx, h, w) = res;
+        //atomicAdd((&out_4d(bz,bx,h,w)),res);
     }
 
     #undef out_4d
     #undef in_4d
     #undef mask_4d
+    #undef tile_3d
 }
-
  
 __host__ void GPUInterface::conv_forward_gpu_prolog(const float *host_output, const float *host_input, const float *host_mask, float **device_output_ptr, float **device_input_ptr, float **device_mask_ptr, const int B, const int M, const int C, const int H, const int W, const int K, const int S)
 {
@@ -83,6 +67,7 @@ __host__ void GPUInterface::conv_forward_gpu_prolog(const float *host_output, co
     // Copy data from host to device
     cudaMemcpy(*device_input_ptr, host_input, B * C * H * W * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(*device_mask_ptr, host_mask, M * C * K * K * sizeof(float), cudaMemcpyHostToDevice);
+    //cudaMemcpyToSymbol(Mask, host_mask, M * C * K * K * sizeof(float));
     // We pass double pointers for you to initialize the relevant device pointers,
     //  which are passed to the other two functions.
 
@@ -102,14 +87,16 @@ __host__ void GPUInterface::conv_forward_gpu(float *device_output, const float *
     // Set the kernel dimensions and call the kernel
     const int H_out = (H - K)/S + 1;
     const int W_out = (W - K)/S + 1;
-    int blockWidth = TILE_WIDTH + K - 1;
+   
     int W_tile = ceil(1.0 * W_out / TILE_WIDTH);
     int H_tile = ceil(1.0 * H_out / TILE_WIDTH);
     int Z = W_tile * H_tile;
-    size_t sharedX_size = blockWidth * blockWidth * sizeof(float);
+    int blockWidth = (TILE_WIDTH - 1) * S + K;
+    
+    size_t sharedX_size = C * blockWidth * blockWidth * sizeof(float);
     dim3 dimgrid(M, Z, B);
     dim3 dimblock(TILE_WIDTH, TILE_WIDTH, 1);
-    conv_forward_kernel <<<dimgrid, dimblock>>> (device_output, device_input, device_mask, B, M, C, H, W, K, S);
+    conv_forward_kernel <<<dimgrid, dimblock,sharedX_size>>> (device_output, device_input, device_mask, B, M, C, H, W, K, S);
 }
 
 

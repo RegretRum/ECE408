@@ -3,6 +3,8 @@
 #include "gpu-new-forward.h"
 #define TILE_WIDTH 16
 
+__constant__ float Mask[6000];
+
 __global__ void conv_forward_kernel(float *output, const float *input, const float *mask, const int B, const int M, const int C, const int H, const int W, const int K,const int S)
 {
     /*
@@ -36,13 +38,13 @@ __global__ void conv_forward_kernel(float *output, const float *input, const flo
 
     #define out_4d(i3, i2, i1, i0) output[(i3) * (M * H_out * W_out) + (i2) * (H_out * W_out) + (i1) * (W_out) + i0]
     #define in_4d(i3, i2, i1, i0) input[(i3) * (C * H * W) + (i2) * (H * W) + (i1) * (W) + i0]
-    #define mask_4d(i3, i2, i1, i0) mask[(i3) * (C * K * K) + (i2) * (K * K) + (i1) * (K) + i0]
+    #define mask_4d(i3, i2, i1, i0) Mask[(i3) * (C * K * K) + (i2) * (K * K) + (i1) * (K) + i0]
 
     // Insert your GPU convolution kernel code here
     int W_tile = ceil(1.0 * W_out / TILE_WIDTH);
     int H_tile = ceil(1.0 * H_out / TILE_WIDTH);
     int blockWidth = TILE_WIDTH + K - 1;
-
+  
     int bx = blockIdx.x;
     int by = blockIdx.y;
     int bz = blockIdx.z;
@@ -83,6 +85,7 @@ __host__ void GPUInterface::conv_forward_gpu_prolog(const float *host_output, co
     // Copy data from host to device
     cudaMemcpy(*device_input_ptr, host_input, B * C * H * W * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(*device_mask_ptr, host_mask, M * C * K * K * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpyToSymbol(Mask, host_mask, M * C * K * K * sizeof(float));
     // We pass double pointers for you to initialize the relevant device pointers,
     //  which are passed to the other two functions.
 
@@ -108,8 +111,8 @@ __host__ void GPUInterface::conv_forward_gpu(float *device_output, const float *
     int Z = W_tile * H_tile;
     size_t sharedX_size = blockWidth * blockWidth * sizeof(float);
     dim3 dimgrid(M, Z, B);
-    dim3 dimblock(TILE_WIDTH, TILE_WIDTH, 1);
-    conv_forward_kernel <<<dimgrid, dimblock>>> (device_output, device_input, device_mask, B, M, C, H, W, K, S);
+    dim3 dimblock(blockWidth, blockWidth, 1);
+    conv_forward_kernel <<<dimgrid, dimblock,sharedX_size>>> (device_output, device_input, device_mask, B, M, C, H, W, K, S);
 }
 
 

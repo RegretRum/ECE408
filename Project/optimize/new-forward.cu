@@ -25,7 +25,6 @@ __global__ void conv_forward_kernel(float *output, const float *input, const flo
 
     const int H_out = (H - K)/S + 1;
     const int W_out = (W - K)/S + 1;
-
     // (void)H_out; // silence declared but never referenced warning. remove this line when you start working
     // (void)W_out; // silence declared but never referenced warning. remove this line when you start working
 
@@ -41,28 +40,23 @@ __global__ void conv_forward_kernel(float *output, const float *input, const flo
     // Insert your GPU convolution kernel code here
     int W_tile = ceil(1.0 * W_out / TILE_WIDTH);
     int H_tile = ceil(1.0 * H_out / TILE_WIDTH);
-    int blockWidth = TILE_WIDTH + K - 1;
-
     int bx = blockIdx.x;
     int by = blockIdx.y;
-    int bz = blockIdx.z;
-    int h = (blockIdx.y / W_tile) * TILE_WIDTH + threadIdx.y;
-    int w = (blockIdx.y % W_tile) * TILE_WIDTH + threadIdx.x;
-    int tIdx = threadIdx.x + threadIdx.y * blockWidth;
+    int h = (blockIdx.z / W_tile) * TILE_WIDTH + threadIdx.y;
+    int w = (blockIdx.z % W_tile) * TILE_WIDTH + threadIdx.x;
     float acc = 0.0f;
 
     for (int c = 0; c < C; c++) {
         for (int p = 0; p < K; p++) {
             for (int q = 0; q < K; q++) {
                 if (h * S + p < H && w * S + q < W) {
-                    acc += in_4d(bz, c, h*S+p, w*S+q) * mask_4d(bx, c, p, q);
+                    acc += in_4d(bx, c, h*S+p, w*S+q) * mask_4d(by, c, p, q);
                 }
             }
         }
-        __syncthreads();
     }
     if (h < H_out && w < W_out) {
-        out_4d(bz, bx, h, w) = acc;
+        out_4d(bx, by, h, w) = acc;
     }
 
     #undef out_4d
@@ -70,7 +64,7 @@ __global__ void conv_forward_kernel(float *output, const float *input, const flo
     #undef mask_4d
 }
 
- 
+	
 __host__ void GPUInterface::conv_forward_gpu_prolog(const float *host_output, const float *host_input, const float *host_mask, float **device_output_ptr, float **device_input_ptr, float **device_mask_ptr, const int B, const int M, const int C, const int H, const int W, const int K, const int S)
 {
     // Allocate memory for device_output, device_input, and device_mask
@@ -102,12 +96,10 @@ __host__ void GPUInterface::conv_forward_gpu(float *device_output, const float *
     // Set the kernel dimensions and call the kernel
     const int H_out = (H - K)/S + 1;
     const int W_out = (W - K)/S + 1;
-    int blockWidth = TILE_WIDTH + K - 1;
     int W_tile = ceil(1.0 * W_out / TILE_WIDTH);
     int H_tile = ceil(1.0 * H_out / TILE_WIDTH);
     int Z = W_tile * H_tile;
-    size_t sharedX_size = blockWidth * blockWidth * sizeof(float);
-    dim3 dimgrid(M, Z, B);
+    dim3 dimgrid(B, M, Z);
     dim3 dimblock(TILE_WIDTH, TILE_WIDTH, 1);
     conv_forward_kernel <<<dimgrid, dimblock>>> (device_output, device_input, device_mask, B, M, C, H, W, K, S);
 }

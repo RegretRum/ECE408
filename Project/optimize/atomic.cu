@@ -62,7 +62,7 @@ __global__ void conv_forward_kernel(float *output, const float *input, const flo
         __syncthreads();
     }
     if (h < H_out && w < W_out) {
-        out_4d(bz, bx, h, w) = acc;
+        atomicAdd(&out_4d(bz, bx, h, w), acc);
     }
 
     #undef out_4d
